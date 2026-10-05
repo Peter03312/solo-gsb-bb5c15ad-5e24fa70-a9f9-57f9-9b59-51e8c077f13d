@@ -208,6 +208,47 @@
     </div>
   </div>
 
+  <!-- 拆分片段弹窗 -->
+  <div id="splitModal" class="modal hidden">
+    <div class="modal-card wide">
+      <h3>拆分片段（长字幕切成两段）</h3>
+      <p class="meta">片段 #<span id="splitSegId"></span>（<span id="splitSegTime"></span>）｜ 所见修订号 <b id="splitSegRev"></b>
+        <span id="splitTrRevRow" class="hidden">｜ 译文修订号 <b id="splitTrRev"></b></span></p>
+      <p class="meta">切点必须严格位于片段起止之间（整数毫秒）。拆分原子完成：<b>左段保留原片段 ID</b>（修订号 +1），
+        右段获新 ID；两段均转<b>待审</b>，既有质检放行失效（理由保留在历史中）。<span id="splitTrHint" class="hidden">
+        已启用译文轨道：须同时提交左右两段译文，服务端不会丢弃或自动复制原译文。</span></p>
+      <div class="form-row">
+        <label>切点 (ms)
+          <input id="splitCut" type="number" min="0" step="1" />
+        </label>
+        <button type="button" class="btn small" id="splitCutNow">取播放位置</button>
+      </div>
+      <div class="restore-compare">
+        <label class="block">左段原文（起点 → 切点）
+          <textarea id="splitLeftText" rows="3"></textarea>
+        </label>
+        <label class="block">右段原文（切点 → 原终点）
+          <textarea id="splitRightText" rows="3"></textarea>
+        </label>
+      </div>
+      <div id="splitTrBox" class="hidden">
+        <div class="restore-compare">
+          <label class="block">左段译文（<span class="split-lang"></span>）
+            <textarea id="splitLeftTr" rows="3"></textarea>
+          </label>
+          <label class="block">右段译文（<span class="split-lang"></span>）
+            <textarea id="splitRightTr" rows="3"></textarea>
+          </label>
+        </div>
+      </div>
+      <p id="splitError" class="error"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="splitCancel">取消</button>
+        <button type="button" class="btn primary" id="splitSave">确认拆分</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
 
   <!-- 质检放行弹窗 -->

@@ -46,6 +46,11 @@
   - 成功后**仅移动所选原文片段**：时间加上偏移、修订号逐段 +1、撤销原文审校（文字不变）；未选片段完全不动；
   - 所选片段的**译文保留文字但标记为「已失效」**，须按新时间重新校对并再审；发布门禁与译文 SRT 导出据此阻止直接发布；历史发布版本及其原文/译文 SRT 导出结果保持不变；
   - 空选择、重复或不存在的片段 ID、非整数/为零偏移都返回明确的 `422` 错误；预览后草稿发生任何增删改或审校变化，确认返回 `409` 并要求重新预览。
+- **单片段拆分（长字幕切成两段）**：对单个草稿原文片段按**严格位于其起止之间的整数毫秒切点**拆分，一次提交左右两段**非空**原文：
+  - **原子完成**：左段保留原片段 ID 且修订号 +1，右段获新 ID（修订号从 1 开始）；两段均转**待审**；
+  - 启用译文轨道时，须同时提交**同语言左右两段非空译文**——服务端不丢弃也不自动复制原译文；两段译文同样转待审并分别绑定左右段新原文；
+  - 既有**质检放行失效**（历史理由保留可查），质检按拆分后的新时长重新计算；发布门禁、草稿/译文 SRT 导出立即反映拆分结果，历史发布快照与 SRT 不变；
+  - 提交须携带所见原文修订号 `revision`，已有译文时还须携带译文修订号 `translation_revision`；过期返回 `409` 与当前状态且零写入，非法切点、空文本或译文缺失同样零写入（`422`）。
 - **质检（QC）阈值、逐段报告与单项放行**：
   - 每个视频可分别为**原文**与**已启用译文**轨道配置 `最大每秒字符数（CPS）` 与 `最大单行字符数` 两个阈值；阈值必须为正数（单行字符数为正整数，CPS 可为小数），留空/`null` 表示该项不检查；
   - **按 Unicode 码点计数**（emoji 等代理对算 1 个字符）；**换行不计入速度**，速度 = 非换行字符数 ÷ 片段时长（秒，`(end_ms-start_ms)/1000`）；单行字符数按换行切分后取最长行；
@@ -94,7 +99,7 @@ npm start
 
 同样访问 http://localhost:8080 。数据默认写入项目下 `./data/`。
 
-运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入、历史版本区间恢复、多片段整体平移的越界/重叠拒绝/译文失效/门禁联动、译文轨道双修订号/失效规则/双轨发布门禁与快照/译文 SRT 导出，以及质检阈值配置/码点计数/逐段报告/单项放行/失效锁存/发布阻断与版本快照/并发拒绝等 422 个断言）：
+运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入、历史版本区间恢复、多片段整体平移的越界/重叠拒绝/译文失效/门禁联动、译文轨道双修订号/失效规则/双轨发布门禁与快照/译文 SRT 导出、质检阈值配置/码点计数/逐段报告/单项放行/失效锁存/发布阻断与版本快照/并发拒绝，以及片段拆分的切点与空文本校验/双轨双修订号/原子拆分/放行失效重检/历史版本不变等 497 个断言）：
 
 ```bash
 npm test
@@ -123,6 +128,9 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 1. 打开首页，填写标题并选择视频文件上传（需浏览器可解析的 MP4/WebM 等格式）。
 2. 进入工作台：播放视频或点击时间轴定位，用「＋ 新增片段」并可一键取播放位置为起止时间。
 3. 在片段表中编辑、删除、定位；逐条「标记已审」。绿色=已审，蓝色=待审。
+   长字幕可点行内「拆分」：填写严格位于片段起止之间的整数毫秒切点（可一键取播放位置），
+   并提交左右两段非空原文（启用译文轨道时还需左右两段译文）；确认后左段保留原片段 ID（修订号 +1）、
+   右段获新 ID，两段均转待审，既有质检放行失效（理由保留在历史中）。
    需要整体校准时间时，勾选若干片段（表头复选框可全选）后点「⇄ 整体平移…」：
    填写非零整数毫秒偏移（正数延后、负数提前）并「预览平移」，逐段核对调整前后时间、越界与未选片段冲突，
    确认无误后「确认一次性应用」；所选片段相对间距不变、修订号逐段 +1 并撤销原文审校，其译文会标记「已失效」需重新校对。
@@ -146,7 +154,8 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 ## HTTP API 摘要
 
 所有写操作的 JSON 请求体均需携带整数修订号 `revision`（新增片段除外；区间恢复确认、多片段整体平移确认改持预览令牌 `token`；
-译文写操作需同时携带所见原文修订号 `segment_revision`，首次录入译文无需译文 `revision`）。
+译文写操作需同时携带所见原文修订号 `segment_revision`，首次录入译文无需译文 `revision`；
+片段拆分携带所见原文修订号 `revision`，已有译文时还需携带所见译文修订号 `translation_revision`）。
 质检规则修改携带所见规则修订号 `rules_revision`（首次配置传 `0`）；质检放行携带 `segment_revision`，
 译文放行还需译文 `revision`；过期一律 `409 revision_conflict` 并返回当前状态。
 
@@ -158,6 +167,7 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 | `GET` | `/api/videos/:id/media` | 视频流（支持 `Range`） |
 | `POST` | `/api/videos/:id/segments` | 新增片段 `{start_ms,end_ms,text}` |
 | `PUT` | `/api/videos/:id/segments/:sid` | 修改 `{start_ms,end_ms,text,revision}` |
+| `POST` | `/api/videos/:id/segments/:sid/split` | 拆分片段 `{cut_ms,left_text,right_text,revision}`；启用译文轨道时加 `{left_translation,right_translation,translation_revision?}` |
 | `DELETE` | `/api/videos/:id/segments/:sid` | 删除（JSON 体带 `revision`） |
 | `POST` | `/api/videos/:id/segments/:sid/review` | 审校切换 `{reviewed,revision}` |
 | `GET` | `/api/videos/:id/status` | 发布门禁检查 |
@@ -378,6 +388,57 @@ curl -s -X POST http://localhost:8080/api/videos/12/segments/shift/confirm \
 | `422 shift_params_changed` | 确认的选择集合或偏移与预览不一致，需重新预览 |
 | `409 preview_required` | 缺失/伪造/过期（服务重启）的平移预览令牌，需先预览 |
 | `409 draft_changed` | 预览后草稿被修改（增删改或审校变化）；响应附 `current_segments`，必须重新预览后再确认 |
+
+### 片段拆分调用示例
+
+把片段 #7（1000–3000ms，当前修订号 3）在 2000ms 处拆成两段。切点必须**严格位于片段起止之间**；
+左右两段原文都必须非空。拆分原子完成：左段保留 #7（修订号 +1、转待审），右段获新 ID（待审）；
+既有质检放行失效（理由保留在历史），历史发布版本与 SRT 不变。
+
+```bash
+V=12  # 视频 id
+
+# 1) 纯原文拆分（携带所见原文修订号）
+curl -s -X POST http://localhost:8080/api/videos/$V/segments/7/split \
+  -H 'Content-Type: application/json' \
+  -d '{"cut_ms":2000,"left_text":"前半句","right_text":"后半句","revision":3}'
+```
+
+成功返回 `201`（节选）：
+
+```json
+{
+  "ok": true,
+  "left":  { "id": 7, "start_ms": 1000, "end_ms": 2000, "text": "前半句", "reviewed": false, "revision": 4 },
+  "right": { "id": 9, "start_ms": 2000, "end_ms": 3000, "text": "后半句", "reviewed": false, "revision": 1 },
+  "segments": [ /* 拆分后的完整草稿片段列表 */ ],
+  "translations": []
+}
+```
+
+```bash
+# 2) 已启用译文轨道：必须同时提交左右两段非空译文（不丢弃/不复制原译文）；
+#    片段已有译文时还必须携带所见译文修订号 translation_revision
+curl -s -X POST http://localhost:8080/api/videos/$V/segments/7/split \
+  -H 'Content-Type: application/json' \
+  -d '{"cut_ms":2000,"left_text":"前半句","right_text":"后半句","revision":3,
+       "left_translation":"First half","right_translation":"Second half","translation_revision":2}'
+```
+
+启用轨道时返回的 `translations` 为拆分后完整译文列表：左段译文更新为 `left_translation`
+（绑定左段新原文、待审、修订号 +1），右段译文为新行（绑定右段原文、待审、修订号从 1 开始）。
+两段译文 `stale` 均为 `false`（拆分即完成重新绑定）。
+
+失败约定（在通用错误格式 `{ "error": { "code", "message", ... } }` 之上；均零写入）：
+
+| 状态 / code | 含义 |
+| --- | --- |
+| `404 segment_not_found` | 片段不存在 |
+| `422 missing_revision` | 缺少 `revision`；已有译文时缺少 `translation_revision` |
+| `409 revision_conflict` | 原文或译文修订号过期；`error.current` 为当前 `{segment, translation}` 状态，未写入 |
+| `422 invalid_cut` | 切点缺失、非整数，或未严格位于片段起止之间，未写入 |
+| `422 empty_text` | 左/右段原文缺失或为空白（拆分后两段都必须非空），未写入 |
+| `422 missing_translation` | 已启用译文轨道但缺少左/右段译文或其为空白，未写入 |
 
 ### 译文轨道调用示例
 
