@@ -864,6 +864,143 @@ router.delete('/videos/:id(\\d+)/segments/:sid(\\d+)', (req, res, next) => {
   }
 });
 
+/* ---------------- 片段拆分（长字幕一分为二，原子完成） ---------------- */
+
+// 把单个草稿片段在严格位于其起止之间的整数毫秒切点处拆成左右两段：
+// 原片段 ID 保留给左段（修订号 +1），右段获新 ID（修订号从 1 开始）；两段原文均转待审。
+// 启用译文轨道时必须同时提交左右两段非空译文（不能丢弃或直接复制原译文）：
+// 左段译文在原译文行上更新（修订号 +1），右段译文新建；两段译文均待审并重新绑定各自新原文。
+// 既有质检放行随片段时间/文本变化失效（历史理由保留可查），质检规则按新时长重新计算；
+// 历史发布版本及其 SRT 不受影响。过期修订号 / 非法切点 / 空文本 / 译文缺失均零写入。
+router.post('/videos/:id(\\d+)/segments/:sid(\\d+)/split', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const segmentId = Number(req.params.sid);
+    const expected = parseRevision(req.body);
+    const cutMs = Number(req.body && req.body.cut_ms);
+    if (!isInt(cutMs)) {
+      throw new ApiError(422, 'invalid_cut_point', '切点 cut_ms 必须为整数毫秒');
+    }
+    const leftText = normalizeText(req.body && req.body.left_text != null ? req.body.left_text : '');
+    const rightText = normalizeText(req.body && req.body.right_text != null ? req.body.right_text : '');
+    const track = !!video.translation_lang;
+    let leftTrText = null;
+    let rightTrText = null;
+    if (track) {
+      if (!req.body || req.body.left_translation == null || req.body.right_translation == null) {
+        throw new ApiError(422, 'missing_translation',
+          '已启用译文轨道：拆分时须同时提交左右两段译文 left_translation 与 right_translation（不能丢弃原译文）');
+      }
+      leftTrText = normalizeText(req.body.left_translation);
+      rightTrText = normalizeText(req.body.right_translation);
+    }
+
+    const result = get().transaction(() => {
+      const seg = get().prepare('SELECT * FROM segments WHERE id = ? AND video_id = ?').get(segmentId, video.id);
+      if (!seg) throw new ApiError(404, 'segment_not_found', `片段 #${segmentId} 不存在`);
+      if (seg.revision !== expected) {
+        throw new ApiError(409, 'revision_conflict',
+          '原文修订号已过期：该片段已被他人修改，已为你加载当前原文与译文状态，请基于当前内容重试',
+          { current: conflictCurrent(video.id, segmentId) });
+      }
+      if (cutMs <= seg.start_ms || cutMs >= seg.end_ms) {
+        throw new ApiError(422, 'invalid_cut_point',
+          `切点 ${cutMs}ms 必须严格位于片段 #${segmentId} 的起止之间（${seg.start_ms}–${seg.end_ms}ms）`,
+          { current: conflictCurrent(video.id, segmentId) });
+      }
+      if (!leftText.trim()) throw new ApiError(422, 'empty_text', '左段原文不能为空（去首尾空白后至少 1 个字符）');
+      if (!rightText.trim()) throw new ApiError(422, 'empty_text', '右段原文不能为空（去首尾空白后至少 1 个字符）');
+
+      const tr = track ? getTranslationRow(video.id, segmentId) : null;
+      if (track) {
+        if (!leftTrText.trim() || !rightTrText.trim()) {
+          throw new ApiError(422, 'missing_translation', '左右两段译文均不能为空（去首尾空白后至少 1 个字符）');
+        }
+        if (tr) {
+          const trRev = Number(req.body.translation_revision);
+          if (!Number.isInteger(trRev) || trRev < 1) {
+            throw new ApiError(422, 'missing_revision',
+              '该片段已有译文：请携带所见译文修订号 translation_revision（正整数）');
+          }
+          if (tr.revision !== trRev) {
+            throw new ApiError(409, 'revision_conflict',
+              '译文修订号已过期：该译文已被他人修改，已为你加载当前原文与译文状态，请基于当前内容重试',
+              { current: conflictCurrent(video.id, segmentId) });
+          }
+          if (leftTrText.trim() === tr.text.trim() || rightTrText.trim() === tr.text.trim()) {
+            throw new ApiError(422, 'copied_translation',
+              '左右两段译文均不得直接复制原译文，请按拆分后的左右原文重新翻译');
+          }
+        }
+      }
+
+      // 拆分后的全量时间线必须仍然合法（防御性复算；切点严格位于片段内部时天然端点相接）
+      const all = get().prepare('SELECT * FROM segments WHERE video_id = ?').all(video.id);
+      const timeline = all.flatMap((row) => (row.id === segmentId
+        ? [{ id: row.id, start_ms: row.start_ms, end_ms: cutMs },
+          { id: '(new)', start_ms: cutMs, end_ms: row.end_ms }]
+        : [row]));
+      const check = validateTimeline(timeline, video.duration_ms);
+      if (!check.ok) {
+        throw new ApiError(422, 'invalid_timeline', `拆分后时间线不合法，未写入任何内容：${check.reason}`);
+      }
+
+      const ts = now();
+      // 左段沿用原片段 ID：终点收到切点、文本更新、修订号 +1、转待审
+      get().prepare(
+        'UPDATE segments SET end_ms = ?, text = ?, reviewed = 0, revision = revision + 1, updated_at = ? WHERE id = ?'
+      ).run(cutMs, leftText, ts, segmentId);
+      // 右段获新 ID：自切点到原终点，待审，修订号从 1 开始
+      const rightId = get().prepare(
+        `INSERT INTO segments (video_id, start_ms, end_ms, text, reviewed, revision, updated_at)
+         VALUES (?, ?, ?, ?, 0, 1, ?)`
+      ).run(video.id, cutMs, seg.end_ms, rightText, ts).lastInsertRowid;
+      // 片段时间与文本均变化：该片段全部既有质检放行失效（行保留为历史，理由可查）
+      deactivateSegmentQcWaivers(get(), segmentId, ts);
+
+      if (track) {
+        if (tr) {
+          // 原译文行保留给左段：文本更新、修订号 +1、转待审并重新绑定左段原文（不失效）
+          get().prepare(
+            `UPDATE translations
+             SET text = ?, reviewed = 0, revision = revision + 1,
+                 source_start_ms = ?, source_end_ms = ?, source_text = ?, updated_at = ?
+             WHERE id = ?`
+          ).run(leftTrText, seg.start_ms, cutMs, leftText, ts, tr.id);
+        } else {
+          get().prepare(
+            `INSERT INTO translations (video_id, segment_id, text, reviewed, revision,
+                                       source_start_ms, source_end_ms, source_text, created_at, updated_at)
+             VALUES (?, ?, ?, 0, 1, ?, ?, ?, ?, ?)`
+          ).run(video.id, segmentId, leftTrText, seg.start_ms, cutMs, leftText, ts, ts);
+        }
+        // 右段译文新建：待审、修订号从 1 开始、绑定右段原文
+        get().prepare(
+          `INSERT INTO translations (video_id, segment_id, text, reviewed, revision,
+                                     source_start_ms, source_end_ms, source_text, created_at, updated_at)
+           VALUES (?, ?, ?, 0, 1, ?, ?, ?, ?, ?)`
+        ).run(video.id, rightId, rightTrText, cutMs, seg.end_ms, rightText, ts, ts);
+      }
+
+      return {
+        left: mapSegment(get().prepare('SELECT * FROM segments WHERE id = ?').get(segmentId)),
+        right: mapSegment(get().prepare('SELECT * FROM segments WHERE id = ?').get(rightId)),
+      };
+    })();
+
+    res.status(201).json({
+      ok: true,
+      cut_ms: cutMs,
+      left: result.left,
+      right: result.right,
+      segments: listSegments(video.id),
+      translations: listTranslations(video.id),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 /* ---------------- 发布与导出 ---------------- */
 
 // 发布门禁：原文全部已审且时间合法；启用译文轨道时还要求每段译文齐备、

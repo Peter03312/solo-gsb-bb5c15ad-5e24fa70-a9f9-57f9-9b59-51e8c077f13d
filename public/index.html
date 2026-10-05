@@ -40,6 +40,48 @@
     </div>
   </div>
 
+  <!-- 拆分片段弹窗 -->
+  <div id="splitModal" class="modal hidden">
+    <div class="modal-card">
+      <h3>拆分片段（长字幕一分为二）</h3>
+      <p class="meta">片段 #<span id="splitSegId"></span> ｜ 时间 <b id="splitRange"></b> ｜ 所见修订号 <b id="splitRevision"></b><span id="splitTrRevWrap" class="hidden"> ｜ 译文修订号 <b id="splitTrRevision"></b></span></p>
+      <p class="meta">在严格位于起止之间的整数毫秒切点处拆分：左段保留原片段 ID（修订号 +1），右段获新 ID（修订号从 1 开始）；
+        两段均转<b>待审</b>，既有质检放行失效（历史理由保留），历史发布版本及其 SRT 不受影响。</p>
+      <label class="block">当前原文（只读）
+        <pre id="splitSource" class="tr-source"></pre>
+      </label>
+      <label class="block hidden" id="splitTrCurrentWrap">当前译文（只读；拆分后的左右译文均不得与它相同）
+        <pre id="splitTrSource" class="tr-source"></pre>
+      </label>
+      <div class="form-row">
+        <label>切点 (ms，严格位于起止之间)
+          <input id="splitCut" type="number" step="1" />
+        </label>
+        <button type="button" class="btn small" id="splitCutNow">取播放位置</button>
+      </div>
+      <label class="block">左段原文（起点 → 切点，非空）
+        <textarea id="splitLeftText" rows="3"></textarea>
+      </label>
+      <label class="block">右段原文（切点 → 终点，非空）
+        <textarea id="splitRightText" rows="3"></textarea>
+      </label>
+      <div id="splitTrInputs" class="hidden">
+        <p class="meta">译文轨道（<b id="splitTrLang"></b>）：须同时提交左右两段<b>非空译文</b>，不能丢弃或直接复制原译文。</p>
+        <label class="block">左段译文
+          <textarea id="splitLeftTr" rows="3" placeholder="按左段原文重新翻译…"></textarea>
+        </label>
+        <label class="block">右段译文
+          <textarea id="splitRightTr" rows="3" placeholder="按右段原文重新翻译…"></textarea>
+        </label>
+      </div>
+      <p id="splitError" class="error"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="splitCancel">取消（保留原稿）</button>
+        <button type="button" class="btn primary" id="splitSave">确认拆分</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 冲突弹窗 -->
   <div id="conflictModal" class="modal hidden">
     <div class="modal-card">

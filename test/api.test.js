@@ -221,6 +221,7 @@ async function main() {
   await restoreTests();
   await translationTests();
   await shiftTests();
+  await splitTests();
 
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   if (failed) process.exit(1);
@@ -1385,6 +1386,241 @@ async function shiftTests() {
   const stFinal = (await req('GET', `/videos/${qv.id}/status`)).json;
   check('status.qc 汇总字段齐备', typeof stFinal.qc.violation_count === 'number' &&
     typeof stFinal.qc.rules_revision === 'number', JSON.stringify(stFinal.qc));
+}
+
+async function splitTests() {
+  console.log('34. 片段拆分：切点校验、修订号冲突与零写入');
+  const sp = await uploadVideo('拆分视频', 10000, 48);
+  const add = async (s, e, t) =>
+    (await req('POST', `/videos/${sp.id}/segments`, { start_ms: s, end_ms: e, text: t })).json.segment;
+  const getSegs = async () => (await req('GET', `/videos/${sp.id}`)).json.segments;
+
+  const A = await add(1000, 2000, '前半句后半句');
+  const B = await add(2000, 3000, '邻接片段');
+
+  let r = await req('POST', `/videos/${sp.id}/segments/${A.id}/split`,
+    { cut_ms: 1500.5, left_text: '前', right_text: '后', revision: 1 });
+  check('非整数切点 -> 422 invalid_cut_point', r.status === 422 && r.json.error.code === 'invalid_cut_point');
+  r = await req('POST', `/videos/${sp.id}/segments/${A.id}/split`,
+    { cut_ms: 1000, left_text: '前', right_text: '后', revision: 1 });
+  check('切点等于起点 -> 422', r.status === 422 && r.json.error.code === 'invalid_cut_point');
+  r = await req('POST', `/videos/${sp.id}/segments/${A.id}/split`,
+    { cut_ms: 2000, left_text: '前', right_text: '后', revision: 1 });
+  check('切点等于终点 -> 422', r.status === 422 && r.json.error.code === 'invalid_cut_point');
+  r = await req('POST', `/videos/${sp.id}/segments/${A.id}/split`,
+    { cut_ms: 2500, left_text: '前', right_text: '后', revision: 1 });
+  check('切点越出片段 -> 422', r.status === 422 && r.json.error.code === 'invalid_cut_point');
+  r = await req('POST', `/videos/${sp.id}/segments/${A.id}/split`,
+    { cut_ms: 1500, left_text: '前', right_text: '后' });
+  check('缺修订号 -> 422 missing_revision', r.status === 422 && r.json.error.code === 'missing_revision');
+  r = await req('POST', `/videos/${sp.id}/segments/${A.id}/split`,
+    { cut_ms: 1500, left_text: '前', right_text: '后', revision: 7 });
+  check('过期修订号 -> 409 且返回当前状态', r.status === 409 && r.json.error.code === 'revision_conflict' &&
+    r.json.error.current.segment.id === A.id && r.json.error.current.segment.revision === 1, JSON.stringify(r.json));
+  r = await req('POST', `/videos/${sp.id}/segments/999999/split`,
+    { cut_ms: 1500, left_text: '前', right_text: '后', revision: 1 });
+  check('片段不存在 -> 404', r.status === 404 && r.json.error.code === 'segment_not_found');
+  r = await req('POST', `/videos/${sp.id}/segments/${A.id}/split`,
+    { cut_ms: 1500, left_text: '   ', right_text: '后', revision: 1 });
+  check('左段仅空白 -> 422 empty_text', r.status === 422 && r.json.error.code === 'empty_text');
+  r = await req('POST', `/videos/${sp.id}/segments/${A.id}/split`,
+    { cut_ms: 1500, left_text: '前', right_text: '', revision: 1 });
+  check('右段为空 -> 422 empty_text', r.status === 422 && r.json.error.code === 'empty_text');
+  eq('全部失败尝试零写入', (await getSegs()).map((x) => [x.id, x.start_ms, x.end_ms, x.text, x.revision]),
+    [[A.id, 1000, 2000, '前半句后半句', 1], [B.id, 2000, 3000, '邻接片段', 1]]);
+
+  // 已审片段拆分：两段均转待审；左段保留原 ID 且修订号 +1，右段获新 ID
+  r = await req('POST', `/videos/${sp.id}/segments/${A.id}/review`, { reviewed: true, revision: 1 });
+  check('拆分前标记已审', r.status === 200);
+  r = await req('POST', `/videos/${sp.id}/segments/${A.id}/split`,
+    { cut_ms: 1500, left_text: '前半句', right_text: '后半句', revision: 2 });
+  check('拆分成功 201', r.status === 201, JSON.stringify(r.json));
+  eq('左段保留原 ID 且修订号 +1', [r.json.left.id, r.json.left.revision], [A.id, 3]);
+  eq('左段时间与文本', [r.json.left.start_ms, r.json.left.end_ms, r.json.left.text], [1000, 1500, '前半句']);
+  eq('左段转待审', r.json.left.reviewed, false);
+  check('右段获新 ID 且修订号从 1 开始', r.json.right.id !== A.id && r.json.right.revision === 1);
+  eq('右段时间与文本', [r.json.right.start_ms, r.json.right.end_ms, r.json.right.text], [1500, 2000, '后半句']);
+  eq('右段待审', r.json.right.reviewed, false);
+  const rightId = r.json.right.id;
+  let segs = await getSegs();
+  eq('草稿变为 3 段且按时间排序',
+    segs.map((x) => [x.id, x.start_ms, x.end_ms]),
+    [[A.id, 1000, 1500], [rightId, 1500, 2000], [B.id, 2000, 3000]]);
+  eq('相邻片段及其修订号不受影响', [segs[2].text, segs[2].revision, segs[2].reviewed], ['邻接片段', 1, false]);
+
+  // 右段可级联再拆分
+  r = await req('POST', `/videos/${sp.id}/segments/${rightId}/split`,
+    { cut_ms: 1750, left_text: '后', right_text: '半句', revision: 1 });
+  check('右段可再拆分', r.status === 201 && r.json.left.id === rightId && r.json.left.revision === 2);
+  eq('再拆分后共 4 段', (await getSegs()).length, 4);
+
+  // 时长 1ms 的片段不存在严格位于起止之间的整数切点
+  const tiny = await add(4000, 4001, '一');
+  r = await req('POST', `/videos/${sp.id}/segments/${tiny.id}/split`,
+    { cut_ms: 4000, left_text: 'x', right_text: 'y', revision: 1 });
+  check('1ms 片段无合法整数切点 -> 422', r.status === 422 && r.json.error.code === 'invalid_cut_point');
+
+  console.log('35. 拆分与发布门禁、SRT 导出、历史版本不可变');
+  // 拆分产生的待审段阻止发布
+  r = await req('POST', `/videos/${sp.id}/publish`, {});
+  check('存在待审段不能发布 -> 422', r.status === 422 && r.json.error.code === 'not_publishable');
+  // 全部审校后发布 v1
+  for (const s of await getSegs()) {
+    await req('POST', `/videos/${sp.id}/segments/${s.id}/review`, { reviewed: true, revision: s.revision });
+  }
+  r = await req('POST', `/videos/${sp.id}/publish`, {});
+  check('全部审校后发布 v1', r.status === 201 && r.json.publication.version === 1, JSON.stringify(r.json));
+  const v1Srt = await (await fetch(`${BASE}/videos/${sp.id}/srt?version=1`)).text();
+  check('v1 SRT 含 5 段时间戳', (v1Srt.match(/-->/g) || []).length === 5, v1Srt);
+
+  // 发布后再拆分草稿中的 B（2000-3000）
+  const Bcur = (await getSegs()).find((x) => x.id === B.id);
+  r = await req('POST', `/videos/${sp.id}/segments/${B.id}/split`,
+    { cut_ms: 2600, left_text: '邻接', right_text: '片段', revision: Bcur.revision });
+  check('已发布后仍可拆分草稿', r.status === 201, JSON.stringify(r.json));
+  const draftSrt = await (await fetch(`${BASE}/videos/${sp.id}/srt?version=draft`)).text();
+  check('草稿 SRT 反映拆分结果',
+    /00:00:02,000 --> 00:00:02,600/.test(draftSrt) && /00:00:02,600 --> 00:00:03,000/.test(draftSrt), draftSrt);
+  const v1SrtAgain = await (await fetch(`${BASE}/videos/${sp.id}/srt?version=1`)).text();
+  eq('历史发布 v1 的 SRT 不变', v1SrtAgain, v1Srt);
+  const st = (await req('GET', `/videos/${sp.id}/status`)).json;
+  check('拆分后发布门禁阻止发布', st.canPublish === false);
+  check('pending 逐段列出左右两段',
+    st.pending.some((p) => p.segment_id === B.id && p.reasons.includes('segment_unreviewed')) &&
+    st.pending.some((p) => p.segment_id === r.json.right.id && p.reasons.includes('segment_unreviewed')),
+    JSON.stringify(st.pending));
+
+  console.log('36. 拆分与译文轨道：双段译文、复制禁止与双修订号');
+  const tp = await uploadVideo('拆分译文', 10000, 48);
+  await req('PUT', `/videos/${tp.id}/translation/track`, { language: 'en' });
+  const getTp = async () => (await req('GET', `/videos/${tp.id}`)).json;
+  const T1 = (await req('POST', `/videos/${tp.id}/segments`,
+    { start_ms: 1000, end_ms: 3000, text: '长句子需要拆开' })).json.segment;
+
+  // 启用轨道即须提交左右两段译文（即使该段尚无译文）
+  r = await req('POST', `/videos/${tp.id}/segments/${T1.id}/split`,
+    { cut_ms: 2000, left_text: '长句子', right_text: '需要拆开', revision: 1 });
+  check('启用轨道缺译文 -> 422 missing_translation', r.status === 422 && r.json.error.code === 'missing_translation');
+  r = await req('POST', `/videos/${tp.id}/segments/${T1.id}/split`,
+    { cut_ms: 2000, left_text: '长句子', right_text: '需要拆开', revision: 1, left_translation: 'Long sentence', right_translation: ' ' });
+  check('右段译文为空白 -> 422', r.status === 422 && r.json.error.code === 'missing_translation');
+  // 无既有译文时拆分：两段译文新建（无需译文修订号）
+  r = await req('POST', `/videos/${tp.id}/segments/${T1.id}/split`,
+    { cut_ms: 2000, left_text: '长句子', right_text: '需要拆开', revision: 1,
+      left_translation: 'Long sentence', right_translation: 'needs splitting' });
+  check('无既有译文拆分成功 201', r.status === 201, JSON.stringify(r.json));
+  let det = await getTp();
+  eq('拆分后两段均有译文', det.translations.length, 2);
+  const leftTr = det.translations.find((t) => t.segment_id === T1.id);
+  eq('左段译文绑定左段原文且未失效待审',
+    [leftTr.text, leftTr.stale, leftTr.reviewed, leftTr.revision], ['Long sentence', false, false, 1]);
+  const rightTr = det.translations.find((t) => t.segment_id === r.json.right.id);
+  eq('右段译文新建待审', [rightTr.text, rightTr.stale, rightTr.reviewed, rightTr.revision],
+    ['needs splitting', false, false, 1]);
+
+  // 已有译文时：须携带译文修订号；左右译文均不得复制原译文
+  const L = T1.id; // 左段 1000-2000，译文 Long sentence（rev 1）
+  r = await req('POST', `/videos/${tp.id}/segments/${L}/translation/review`,
+    { reviewed: true, segment_revision: 2, revision: 1 });
+  check('左段译文审校（译文 rev -> 2）', r.status === 200, JSON.stringify(r.json));
+  r = await req('POST', `/videos/${tp.id}/segments/${L}/split`,
+    { cut_ms: 1500, left_text: '长', right_text: '句子', revision: 2,
+      left_translation: 'Long', right_translation: 'sentence' });
+  check('缺译文修订号 -> 422 missing_revision', r.status === 422 && r.json.error.code === 'missing_revision');
+  r = await req('POST', `/videos/${tp.id}/segments/${L}/split`,
+    { cut_ms: 1500, left_text: '长', right_text: '句子', revision: 2,
+      left_translation: 'Long', right_translation: 'sentence', translation_revision: 9 });
+  check('译文修订号过期 -> 409 且返回当前译文', r.status === 409 &&
+    r.json.error.current.translation.text === 'Long sentence', JSON.stringify(r.json));
+  r = await req('POST', `/videos/${tp.id}/segments/${L}/split`,
+    { cut_ms: 1500, left_text: '长', right_text: '句子', revision: 2,
+      left_translation: 'Long sentence', right_translation: 'sentence', translation_revision: 2 });
+  check('左译文复制原译文 -> 422 copied_translation', r.status === 422 && r.json.error.code === 'copied_translation');
+  r = await req('POST', `/videos/${tp.id}/segments/${L}/split`,
+    { cut_ms: 1500, left_text: '长', right_text: '句子', revision: 2,
+      left_translation: 'Long', right_translation: 'Long sentence', translation_revision: 2 });
+  check('右译文复制原译文 -> 422', r.status === 422 && r.json.error.code === 'copied_translation');
+  det = await getTp();
+  eq('失败尝试零写入（片段与译文均不变）',
+    [det.segments.length, det.translations.length, det.translations.find((t) => t.segment_id === L).revision],
+    [2, 2, 2]);
+
+  // 携带双修订号拆分成功：原译文行保留给左段（修订号 +1、转待审、重新绑定不失效）
+  r = await req('POST', `/videos/${tp.id}/segments/${L}/split`,
+    { cut_ms: 1500, left_text: '长', right_text: '句子', revision: 2,
+      left_translation: 'Long', right_translation: 'sentence', translation_revision: 2 });
+  check('携带双修订号拆分成功', r.status === 201, JSON.stringify(r.json));
+  det = await getTp();
+  const newLeftTr = det.translations.find((t) => t.segment_id === L);
+  eq('原译文行保留给左段：修订号 +1、待审、未失效',
+    [newLeftTr.text, newLeftTr.revision, newLeftTr.reviewed, newLeftTr.stale], ['Long', 3, false, false]);
+  const newRightTr = det.translations.find((t) => t.segment_id === r.json.right.id);
+  eq('右段译文新建待审', [newRightTr.text, newRightTr.revision, newRightTr.reviewed, newRightTr.stale],
+    ['sentence', 1, false, false]);
+
+  // 双轨齐备发布 v1；随后拆分草稿，历史双轨快照与译文 SRT 不变
+  det = await getTp();
+  for (const s of det.segments) {
+    await req('POST', `/videos/${tp.id}/segments/${s.id}/review`, { reviewed: true, revision: s.revision });
+  }
+  det = await getTp();
+  for (const t of det.translations) {
+    const segRev = det.segments.find((s) => s.id === t.segment_id).revision;
+    await req('POST', `/videos/${tp.id}/segments/${t.segment_id}/translation/review`,
+      { reviewed: true, segment_revision: segRev, revision: t.revision });
+  }
+  r = await req('POST', `/videos/${tp.id}/publish`, {});
+  check('双轨齐备发布 v1', r.status === 201 && r.json.publication.has_translation === true, JSON.stringify(r.json));
+  const v1TrSrt = await (await fetch(`${BASE}/videos/${tp.id}/srt/translation?version=1`)).text();
+  check('v1 译文 SRT 含 3 段', (v1TrSrt.match(/-->/g) || []).length === 3, v1TrSrt);
+
+  det = await getTp();
+  const R2 = det.segments.find((s) => s.start_ms === 2000);
+  const R2tr = det.translations.find((t) => t.segment_id === R2.id);
+  r = await req('POST', `/videos/${tp.id}/segments/${R2.id}/split`,
+    { cut_ms: 2500, left_text: '需要', right_text: '拆开', revision: R2.revision,
+      left_translation: 'needs', right_translation: 'to split', translation_revision: R2tr.revision });
+  check('发布后拆分草稿成功', r.status === 201, JSON.stringify(r.json));
+  const v1TrSrtAgain = await (await fetch(`${BASE}/videos/${tp.id}/srt/translation?version=1`)).text();
+  eq('历史发布 v1 译文 SRT 不变', v1TrSrtAgain, v1TrSrt);
+  const draftTrSrt = await (await fetch(`${BASE}/videos/${tp.id}/srt/translation?version=draft`)).text();
+  check('草稿译文 SRT 反映拆分（4 段且含切点）',
+    (draftTrSrt.match(/-->/g) || []).length === 4 && /00:00:02,000 --> 00:00:02,500/.test(draftTrSrt), draftTrSrt);
+  const st2 = (await req('GET', `/videos/${tp.id}/status`)).json;
+  check('拆分后双轨门禁阻止发布', st2.canPublish === false &&
+    st2.pending.some((p) => p.reasons.includes('translation_unreviewed')), JSON.stringify(st2.pending));
+
+  console.log('37. 拆分与质检：放行失效保留历史、按新时长重新质检');
+  const qp = await uploadVideo('拆分质检', 10000, 48);
+  const Q1 = (await req('POST', `/videos/${qp.id}/segments`,
+    { start_ms: 1000, end_ms: 2000, text: '一二三四五六七八九十' })).json.segment;
+  await req('PUT', `/videos/${qp.id}/qc/rules`, { source_max_cps: 5, rules_revision: 0 });
+  // 10 字 / 1 秒 = 10 cps > 5 -> 违规；填写理由放行
+  r = await req('PUT', `/videos/${qp.id}/segments/${Q1.id}/qc/waiver`,
+    { track: 'source', rule: 'max_cps', reason: '快语速已核对', segment_revision: 1 });
+  check('拆分前放行成功', r.status === 201, JSON.stringify(r.json));
+  let qc = (await req('GET', `/videos/${qp.id}/qc`)).json;
+  eq('拆分前违规已放行', [qc.violation_count, qc.blocking_count, qc.active_waiver_count], [1, 0, 1]);
+
+  // 拆分为两段各 5 字 / 0.5 秒 = 10 cps：按新时长重新质检仍违规，且既有放行失效
+  r = await req('POST', `/videos/${qp.id}/segments/${Q1.id}/split`,
+    { cut_ms: 1500, left_text: '一二三四五', right_text: '六七八九十', revision: 1 });
+  check('拆分成功', r.status === 201, JSON.stringify(r.json));
+  qc = (await req('GET', `/videos/${qp.id}/qc`)).json;
+  eq('拆分后按新时长重新质检：两段均违规', qc.violation_count, 2);
+  eq('两段违规均未放行', qc.blocking_count, 2);
+  eq('既有放行已失效', qc.active_waiver_count, 0);
+  check('失效放行历史理由保留可查',
+    qc.waivers.some((w) => !w.active && w.reason === '快语速已核对' && w.revoked_at != null),
+    JSON.stringify(qc.waivers));
+
+  // 未放行违规阻止发布（审校两段后仍被质检拦截）
+  await req('POST', `/videos/${qp.id}/segments/${Q1.id}/review`, { reviewed: true, revision: 2 });
+  const qRight = (await req('GET', `/videos/${qp.id}`)).json.segments.find((x) => x.id !== Q1.id);
+  await req('POST', `/videos/${qp.id}/segments/${qRight.id}/review`, { reviewed: true, revision: 1 });
+  r = await req('POST', `/videos/${qp.id}/publish`, {});
+  check('未放行违规阻止发布 -> 422 qc_blocked', r.status === 422 && r.json.error.code === 'qc_blocked',
+    JSON.stringify(r.json));
 }
 
 const server = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {

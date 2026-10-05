@@ -228,6 +228,7 @@ function stopPolling() {
 function anyModalOpen() {
   return !$('editorModal').classList.contains('hidden') ||
          !$('conflictModal').classList.contains('hidden') ||
+         !$('splitModal').classList.contains('hidden') ||
          !$('importModal').classList.contains('hidden') ||
          !$('restoreModal').classList.contains('hidden') ||
          !$('shiftModal').classList.contains('hidden') ||
@@ -466,6 +467,7 @@ function renderSegmentTable() {
       <td><div class="row-actions">
         <button class="btn small" data-act="seek">定位</button>
         <button class="btn small" data-act="edit">编辑</button>
+        <button class="btn small" data-act="split">拆分</button>
         <button class="btn small ${s.reviewed ? 'ghost' : 'ok'}" data-act="review">${s.reviewed ? '取消审校' : '标记已审'}</button>
         ${trActions}
         <button class="btn small danger" data-act="del">删除</button>
@@ -489,6 +491,7 @@ function renderSegmentTable() {
       renderSegmentTable();
     });
     tr.querySelector('[data-act=edit]').addEventListener('click', () => openEditor('edit', seg));
+    tr.querySelector('[data-act=split]').addEventListener('click', () => openSplitModal(seg));
     tr.querySelector('[data-act=review]').addEventListener('click', () => toggleReview(seg));
     tr.querySelector('[data-act=del]').addEventListener('click', () => deleteSegment(seg));
     const trEditBtn = tr.querySelector('[data-act=tr-edit]');
@@ -620,6 +623,93 @@ async function refreshCurrent() {
   syncShiftSelected();
   renderSegmentDependent();
   try { await loadQcReport(); renderQcPanel(); } catch (_) { /* 忽略 */ }
+}
+
+/* ================= 片段拆分弹窗 ================= */
+const splitEditor = { segmentId: null };
+
+function openSplitModal(seg) {
+  splitEditor.segmentId = seg.id;
+  const track = !!state.translationLang;
+  const tr = track ? trOf(seg.id) : null;
+  $('splitSegId').textContent = seg.id;
+  $('splitRange').textContent = `${fmtTime(seg.start_ms)} → ${fmtTime(seg.end_ms)}`;
+  $('splitRevision').textContent = seg.revision;
+  $('splitSource').textContent = seg.text || '(空文本)';
+  $('splitTrCurrentWrap').classList.toggle('hidden', !(track && tr));
+  if (track && tr) $('splitTrSource').textContent = tr.text || '(空)';
+  $('splitTrRevWrap').classList.toggle('hidden', !(track && tr));
+  if (track && tr) $('splitTrRevision').textContent = tr.revision;
+  $('splitTrInputs').classList.toggle('hidden', !track);
+  if (track) $('splitTrLang').textContent = state.translationLang;
+  // 默认切点：播放位置落在片段内部时取播放位置，否则取片段中点
+  const play = currentMs();
+  $('splitCut').value = play > seg.start_ms && play < seg.end_ms
+    ? play : Math.floor((seg.start_ms + seg.end_ms) / 2);
+  $('splitLeftText').value = seg.text;
+  $('splitRightText').value = '';
+  $('splitLeftTr').value = '';
+  $('splitRightTr').value = '';
+  $('splitError').textContent = '';
+  $('splitModal').classList.remove('hidden');
+}
+
+function closeSplitModal() {
+  splitEditor.segmentId = null;
+  $('splitModal').classList.add('hidden');
+}
+
+async function saveSplit() {
+  const seg = state.segments.find((s) => s.id === splitEditor.segmentId);
+  if (!seg) { closeSplitModal(); return; }
+  const tr = state.translationLang ? trOf(seg.id) : null;
+  const body = {
+    cut_ms: Number($('splitCut').value),
+    left_text: $('splitLeftText').value,
+    right_text: $('splitRightText').value,
+    revision: seg.revision,
+  };
+  if (state.translationLang) {
+    body.left_translation = $('splitLeftTr').value;
+    body.right_translation = $('splitRightTr').value;
+    if (tr) body.translation_revision = tr.revision;
+  }
+  $('splitError').textContent = '';
+  try {
+    const data = await api(`/api/videos/${state.video.id}/segments/${seg.id}/split`, { method: 'POST', body });
+    state.segments = data.segments;
+    state.translations = data.translations || [];
+    closeSplitModal();
+    renderSegmentDependent();
+    // 拆分改变时长并使放行失效：立即刷新质检报告与发布门禁
+    loadQcReport().then(() => { renderQcPanel(); renderPublishCard(); }).catch(() => {});
+    toast(`已拆分为 #${data.left.id}（左）与 #${data.right.id}（右），两段均待审`);
+  } catch (err) {
+    if (err.status === 409) {
+      // 修订号过期：刷新为当前原文/译文状态，保留用户已输入的拆分内容
+      await refreshCurrent();
+      const fresh = state.segments.find((s) => s.id === splitEditor.segmentId);
+      if (!fresh) {
+        closeSplitModal();
+        toast('冲突：该片段已被他人删除', true);
+        return;
+      }
+      const freshTr = state.translationLang ? trOf(fresh.id) : null;
+      $('splitRange').textContent = `${fmtTime(fresh.start_ms)} → ${fmtTime(fresh.end_ms)}`;
+      $('splitRevision').textContent = fresh.revision;
+      $('splitSource').textContent = fresh.text || '(空文本)';
+      $('splitTrCurrentWrap').classList.toggle('hidden', !(state.translationLang && freshTr));
+      $('splitTrRevWrap').classList.toggle('hidden', !(state.translationLang && freshTr));
+      if (freshTr) {
+        $('splitTrSource').textContent = freshTr.text || '(空)';
+        $('splitTrRevision').textContent = freshTr.revision;
+      }
+      $('splitError').textContent = `未拆分：${err.message}`;
+      return;
+    }
+    // 422 等非法修改：保留弹窗与用户输入（原稿未被服务端改动）
+    $('splitError').textContent = `未拆分：${err.message}`;
+  }
 }
 
 /* ================= 多片段整体平移 ================= */
@@ -1637,6 +1727,10 @@ $('editorSave').addEventListener('click', saveEditor);
 $('editStartNow').addEventListener('click', () => { $('editStart').value = currentMs(); });
 $('editEndNow').addEventListener('click', () => { $('editEnd').value = currentMs(); });
 $('editorModal').addEventListener('click', (e) => { if (e.target === $('editorModal')) closeEditor(); });
+$('splitCancel').addEventListener('click', closeSplitModal);
+$('splitSave').addEventListener('click', saveSplit);
+$('splitCutNow').addEventListener('click', () => { $('splitCut').value = currentMs(); });
+$('splitModal').addEventListener('click', (e) => { if (e.target === $('splitModal')) closeSplitModal(); });
 $('importCancel').addEventListener('click', closeImportModal);
 $('importPreviewBtn').addEventListener('click', previewImport);
 $('importAppendBtn').addEventListener('click', () => confirmImport('append'));
